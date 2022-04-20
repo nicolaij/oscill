@@ -1,14 +1,10 @@
-#include <stdio.h>
+#include "main.h"
+
 #include "esp_system.h"
 #include "esp_spi_flash.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#include "driver/gpio.h"
-#include "esp_sleep.h"
-
 #include "driver/temp_sensor.h"
+
 
 void app_main()
 {
@@ -37,8 +33,11 @@ void app_main()
     temp_sensor_start();
     temp_sensor_read_celsius(&tsens_out);
     ESP_LOGI(TAG, "Temperature out celsius %f°C", tsens_out);
+    temp_sensor_stop();
+
 
     //xTaskCreate(dual_adc, "dual_adc", 1024 * 4, NULL, 6, NULL);
+    xTaskCreate(wifi_task, "wifi_task", 1024 * 4, NULL, 5, NULL);
 
     while (1)
     {

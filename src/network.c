@@ -6,6 +6,9 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+
+#include "main.h"
+
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -18,6 +21,8 @@
 #include "esp_netif.h"
 
 #include <esp_http_server.h>
+
+#include "esp_sntp.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -50,6 +55,8 @@ static int s_retry_num = 0;
 
 char buf[512];
 size_t buf_len;
+
+bool need_ws_send;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -118,13 +125,6 @@ void wifi_init_softap(void)
     {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
-
-    static char wifi_name[32] = AP_WIFI_SSID;
-    int l = strlen(wifi_name);
-    itoa(id, &wifi_name[l], 10);
-
-    strlcpy((char *)wifi_config.ap.ssid, wifi_name, sizeof(wifi_config.ap.ssid));
-    wifi_config.ap.ssid_len = strlen(wifi_name);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
@@ -211,11 +211,7 @@ static esp_err_t settings_handler(httpd_req_t *req)
                        "<meta http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\">"
                        "<meta name=\"viewport\" content=\"width=device-width\">"
                        "<title>Settings</title></head><body>";
-    const char *sodkstart = "<form><fieldset><legend>СОДК</legend><table>";
-    const char *sodkend = "</table><input type=\"submit\" value=\"Сохранить\" /></fieldset></form>";
 
-    const char *lorastart = "<form><fieldset><legend>LoRa</legend><table>";
-    const char *loraend = "</table><input type=\"submit\" value=\"Сохранить\" /></fieldset></form>";
     const char *tail = "<p><a href=\"/d\">Буфер данных</a></p>"
                        "<p><textarea id=\"text\" style=\"width:98\%;height:400px;\"></textarea></p>\n"
                        "<script>var socket = new WebSocket(\"ws://\" + location.host + \"/ws\");\n"
@@ -223,38 +219,6 @@ static esp_err_t settings_handler(httpd_req_t *req)
                        "socket.onmessage = function(e){document.getElementById(\"text\").value += e.data + \"\\n\";}"
                        "</script>"
                        "</body></html>";
-
-    const char *lora_set_id[] = {
-        "<tr><td><label for=\"id\">ID transceiver:</label></td><td><input type=\"text\" name=\"id\" id=\"id\" size=\"7\" value=\"",
-        "\" /></td></tr>"};
-
-    const char *lora_set_bw[] = {
-        "<tr><td><label for='bw'>Signal bandwidth:</label></td><td><select name='bw' id='bw'>",
-        "</select></td></tr>"};
-
-    const char *lora_set_bw_options[10][3] = {
-        {"<option value=", "0", ">7.8 kHz</option>"},
-        {"<option value=", "1", ">10.4 kHz</option>"},
-        {"<option value=", "2", ">15.6 kHz</option>"},
-        {"<option value=", "3", ">20.8 kHz</option>"},
-        {"<option value=", "4", ">31.25 kHz</option>"},
-        {"<option value=", "5", ">41.7 kHz</option>"},
-        {"<option value=", "6", ">62.5 kHz</option>"},
-        {"<option value=", "7", ">125 kHz</option>"},
-        {"<option value=", "8", ">250 kHz</option>"},
-        {"<option value=", "9", ">500 kHz</option>"}};
-
-    const char *lora_set_fr[] = {
-        "<tr><td><label for=\"fr\">Signal frequency:</label></td><td><input type=\"text\" name=\"fr\" id=\"fr\" size=\"7\" value=\"",
-        "\" />  kHz</td></tr>"};
-
-    const char *lora_set_sf[] = {
-        "<tr><td><label for=\"sf\">Spreading Factor(6-12):</label></td><td><input type=\"text\" name=\"sf\" id=\"sf\" size=\"7\" value=\"",
-        "\" /></td></tr>"};
-
-    const char *lora_set_op[] = {
-        "<tr><td><label for=\"op\">Output Power(2-17):</label></td><td><input type=\"text\" name=\"op\" id=\"op\" size=\"7\" value=\"",
-        "\" /></td></tr>"};
 
     char param[32];
 
@@ -267,203 +231,14 @@ static esp_err_t settings_handler(httpd_req_t *req)
         if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
         {
             ESP_LOGI(TAGH, "Found URL query => %s", buf);
-
-            bool param_change = false;
-
-            for (int i = 0; i < 12; i++)
-            {
-                if (httpd_query_key_value(buf, menu[i].id, param, 7) == ESP_OK)
-                {
-                    int p = atoi(param);
-                    if (menu[i].val != p && p >= menu[i].min && p <= menu[i].max)
-                    {
-                        param_change = true;
-
-                        menu[i].val = p;
-
-                        nvs_handle_t my_handle;
-                        esp_err_t err = nvs_open("storage", NVS_READWRITE, &my_handle);
-                        if (err != ESP_OK)
-                        {
-                            printf("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
-                        }
-                        else
-                        {
-                            // Write
-                            printf("Write: \"%s\" ", menu[i].name);
-                            err = nvs_set_i32(my_handle, menu[i].id, menu[i].val);
-                            printf((err != ESP_OK) ? "Failed!\n" : "Done\n");
-
-                            // Commit written value.
-                            // After setting any values, nvs_commit() must be called to ensure changes are written
-                            // to flash storage. Implementations may write to storage at other times,
-                            // but this is not guaranteed.
-                            printf("Committing updates in NVS ... ");
-                            err = nvs_commit(my_handle);
-                            printf((err != ESP_OK) ? "Failed!\n" : "Done\n");
-
-                            // Close
-                            nvs_close(my_handle);
-                        }
-                    }
-                }
-            }
-
-            if (httpd_query_key_value(buf, "id", param, 7) == ESP_OK)
-            {
-                int p = atoi(param);
-                if (id != p && p > 0 && p < 1000000)
-                {
-                    param_change = true;
-                    id = p;
-                    write_nvs_lora("id", id);
-                }
-            }
-
-            if (httpd_query_key_value(buf, "fr", param, 7) == ESP_OK)
-            {
-                int p = atoi(param);
-                if (fr != p && p > 800000 && p < 1000000)
-                {
-                    param_change = true;
-                    fr = p;
-                    write_nvs_lora("fr", fr);
-                }
-            }
-
-            if (httpd_query_key_value(buf, "op", param, 3) == ESP_OK)
-            {
-                int p = atoi(param);
-                if (op != p && p >= 2 && p <= 17)
-                {
-                    param_change = true;
-                    op = p;
-                    write_nvs_lora("op", op);
-                }
-            }
-
-            if (httpd_query_key_value(buf, "bw", param, 2) == ESP_OK)
-            {
-                int p = atoi(param);
-                if (bw != p && p >= 0 && p <= 9)
-                {
-                    param_change = true;
-                    bw = p;
-                    write_nvs_lora("bw", bw);
-                }
-            }
-
-            if (httpd_query_key_value(buf, "sf", param, 3) == ESP_OK)
-            {
-                int p = atoi(param);
-                if (sf != p && p >= 6 && p <= 12)
-                {
-                    param_change = true;
-                    sf = p;
-                    write_nvs_lora("sf", sf);
-                }
-            }
-
-            if (param_change)
-            {
-                httpd_resp_set_status(req, "307 Temporary Redirect");
-                httpd_resp_set_hdr(req, "Location", PAGE_LORA_SET);
-                httpd_resp_send(req, NULL, 0); // Response body can be empty
-                return ESP_OK;
-            }
         }
     }
 
     httpd_resp_sendstr_chunk(req, head);
 
-    //-----------------------------СОДК------------------------------
-    httpd_resp_sendstr_chunk(req, sodkstart);
-    for (int i = 0; i < 12; i++)
-    {
-        if (i % 2 == 0)
-            strlcpy(buf, "\n<tr>", sizeof(buf));
-        else
-            strlcpy(buf, " ", sizeof(buf));
-
-        strlcat(buf, "<td><label for=\"", sizeof(buf));
-        strlcat(buf, menu[i].id, sizeof(buf));
-        strlcat(buf, "\">", sizeof(buf));
-        strlcat(buf, menu[i].name, sizeof(buf));
-        strlcat(buf, "</label></td><td><input type=\"text\" name=\"", sizeof(buf));
-        strlcat(buf, menu[i].id, sizeof(buf));
-        strlcat(buf, "\" id=\"", sizeof(buf));
-        strlcat(buf, menu[i].id, sizeof(buf));
-        strlcat(buf, "\" size=\"7\" value=\"", sizeof(buf));
-        itoa(menu[i].val, param, 10);
-        strlcat(buf, param, sizeof(buf));
-        strlcat(buf, "\" /></td>", sizeof(buf));
-
-        if (i % 2 == 1)
-            strlcat(buf, "</tr>", sizeof(buf));
-
-        httpd_resp_sendstr_chunk(req, buf);
-    }
-    httpd_resp_sendstr_chunk(req, sodkend);
-
-    //-----------------------------LoRa------------------------------
-    httpd_resp_sendstr_chunk(req, lorastart);
-
-    // Generate id
-    strlcpy(buf, lora_set_id[0], sizeof(buf));
-    itoa(id, param, 10);
-    strlcat(buf, param, sizeof(buf));
-    strlcat(buf, lora_set_id[1], sizeof(buf));
-    httpd_resp_sendstr_chunk(req, buf);
-
-    // Generate fr
-    strlcpy(buf, lora_set_fr[0], sizeof(buf));
-    itoa(fr, param, 10);
-    strlcat(buf, param, sizeof(buf));
-    strlcat(buf, lora_set_fr[1], sizeof(buf));
-    httpd_resp_sendstr_chunk(req, buf);
-
-    // Generate bw
-    strlcpy(buf, lora_set_bw[0], sizeof(buf));
-    for (int i = 0; i < 10; i++)
-    {
-        strlcat(buf, lora_set_bw_options[i][0], sizeof(buf));
-        param[0] = '"';
-        param[1] = *lora_set_bw_options[i][1];
-        param[2] = '"';
-        param[3] = 0;
-        int n = atoi(lora_set_bw_options[i][1]);
-        if (n == bw)
-        {
-            strcpy(&param[3], " selected");
-        }
-
-        strlcat(buf, param, sizeof(buf));
-        strlcat(buf, lora_set_bw_options[i][2], sizeof(buf));
-    }
-    strlcat(buf, lora_set_bw[1], sizeof(buf));
-    httpd_resp_sendstr_chunk(req, buf);
-
-    // Generate sf
-    strlcpy(buf, lora_set_sf[0], sizeof(buf));
-    itoa(sf, param, 10);
-    strlcat(buf, param, sizeof(buf));
-    strlcat(buf, lora_set_sf[1], sizeof(buf));
-    httpd_resp_sendstr_chunk(req, buf);
-
-    // Generate op
-    strlcpy(buf, lora_set_op[0], sizeof(buf));
-    itoa(op, param, 10);
-    strlcat(buf, param, sizeof(buf));
-    strlcat(buf, lora_set_op[1], sizeof(buf));
-    httpd_resp_sendstr_chunk(req, buf);
-
-    httpd_resp_sendstr_chunk(req, loraend);
-
     httpd_resp_sendstr_chunk(req, tail);
     /* Send empty chunk to signal HTTP response completion */
     httpd_resp_sendstr_chunk(req, NULL);
-
-    reset_sleep_timeout();
 
     return ESP_OK;
 }
@@ -480,44 +255,38 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Content-Disposition", header);
     uint8_t *ptr_adc = 0;
-
-    buf[0] = 0;
-    int l = 0;
-    int n = 0;
-    while (getADC_Data(line, &ptr_adc, &n) > 0)
-    {
-        l = strlcat(buf, line, sizeof(buf));
-        if (l > (sizeof(buf) - sizeof(line)))
+    /*
+        buf[0] = 0;
+        int l = 0;
+        int n = 0;
+        while (getADC_Data(line, &ptr_adc, &n) > 0)
         {
-            /* Send the buffer contents as HTTP response chunk */
-            if (httpd_resp_send_chunk(req, buf, l) != ESP_OK)
+            l = strlcat(buf, line, sizeof(buf));
+            if (l > (sizeof(buf) - sizeof(line)))
             {
-                ESP_LOGE(TAG, "File sending failed!");
-                /* Abort sending file */
-                httpd_resp_sendstr_chunk(req, NULL);
-                /* Respond with 500 Internal Server Error */
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
-                return ESP_FAIL;
+                if (httpd_resp_send_chunk(req, buf, l) != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "File sending failed!");
+                    httpd_resp_sendstr_chunk(req, NULL);
+                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+                    return ESP_FAIL;
+                }
+
+                buf[0] = 0;
+                l = 0;
             }
 
-            buf[0] = 0;
-            l = 0;
+            if (n % 1000 == 0)
+            {
+                vTaskDelay(1);
+            }
         }
 
-        if (n % 1000 == 0)
+        if (l > 0)
         {
-            vTaskDelay(1);
-            reset_sleep_timeout();
+            httpd_resp_send_chunk(req, buf, l);
         }
-    }
-
-    if (l > 0)
-    {
-        httpd_resp_send_chunk(req, buf, l);
-    }
-
-    reset_sleep_timeout();
-
+    */
     /* Respond with an empty chunk to signal HTTP response completion */
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
@@ -533,7 +302,9 @@ static void ws_async_send(char *msg)
 {
     if (ws_fd == 0)
         return;
-    static httpd_ws_frame_t ws_pkt;
+
+    httpd_ws_frame_t ws_pkt;
+
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.payload = (uint8_t *)msg;
     ws_pkt.len = strlen(msg);
@@ -564,17 +335,10 @@ static esp_err_t ws_handler(httpd_req_t *req)
     ESP_LOGI(TAGH, "ws_fd: %d", ws_fd);
 
     if (strcmp("open ws", (const char *)ws_pkt.payload) == 0)
-        need_ws_send = true;
+    {
+        bool need_ws_send = true;
+    }
 
-    /*
-        strlcpy((char*)buf, "Test!!!", sizeof(buf));
-
-        ret = httpd_ws_send_frame(req, &ws_pkt);
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAGH, "httpd_ws_send_frame failed with %d", ret);
-        }
-        */
     return ret;
 }
 
@@ -585,8 +349,8 @@ static const httpd_uri_t file_download = {
     .handler = download_get_handler,
 };
 
-static const httpd_uri_t lora_set = {
-    .uri = PAGE_LORA_SET,
+static const httpd_uri_t root = {
+    .uri = "/",
     .method = HTTP_GET,
     .handler = settings_handler,
     /* Let's pass response string in user
@@ -612,7 +376,7 @@ static httpd_handle_t start_webserver(void)
     {
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
-        httpd_register_uri_handler(server, &lora_set);
+        httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_download);
 
@@ -625,21 +389,45 @@ static httpd_handle_t start_webserver(void)
     return NULL;
 }
 
+void time_sync_notification_cb(struct timeval *tv)
+{
+    char strftime_buf[64];
+    time_t now = tv->tv_sec;
+    struct tm timeinfo = {0};
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(TAG, "The current date/time in Minks is: %s", strftime_buf);
+    ESP_LOGI(TAG, "Notification of a time synchronization event");
+}
+
 void wifi_task(void *arg)
 {
+
     char msg[256];
 
-    int wifi_on = 1;
+    // Set timezone to BY
+    setenv("TZ", "UTC-3", 1);
+    tzset();
 
-    if (wifi_init_sta() == 0)
+    if (wifi_init_sta())
+    {
+        ESP_LOGI(TAG, "Initializing SNTP");
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "by.pool.ntp.org");
+        sntp_setservername(1, "time.windows.com");
+        sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+        sntp_init();
+    }
+    else
+    {
         wifi_init_softap();
+    }
 
     /* Start the server for the first time */
     start_webserver();
-
-    menu[12].val = 1;
-
-    reset_sleep_timeout();
 
     while (1)
     {
@@ -652,13 +440,7 @@ void wifi_task(void *arg)
         if (need_ws_send && ws_fd > 0)
         {
             httpd_queue_work(ws_hd, ws_async_send, msg);
-            reset_sleep_timeout();
             need_ws_send = false;
-        }
-
-        if (esp_timer_get_time() - timeout_start > sleeptimeout)
-        {
-            xEventGroupSetBits(ready_event_group, END_WIFI_TIMEOUT);
         }
 
         vTaskDelay(1);
