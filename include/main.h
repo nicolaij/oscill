@@ -13,3 +13,6 @@
 QueueHandle_t ws_send_queue;
 
 void wifi_task(void *arg);
+void adc1_task(void *arg);
+void adc_dma_task(void *arg);
+

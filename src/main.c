@@ -5,6 +5,8 @@
 
 #include "driver/temp_sensor.h"
 
+#include "nvs.h"
+#include "nvs_flash.h"
 
 void app_main()
 {
@@ -35,8 +37,20 @@ void app_main()
     ESP_LOGI(TAG, "Temperature out celsius %f°C", tsens_out);
     temp_sensor_stop();
 
+    //  Initialize NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 
-    //xTaskCreate(dual_adc, "dual_adc", 1024 * 4, NULL, 6, NULL);
+    // xTaskCreate(dual_adc, "dual_adc", 1024 * 4, NULL, 6, NULL);
+    xTaskCreate(adc_dma_task, "adc_task", 1024 * 4, NULL, 5, NULL);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
     xTaskCreate(wifi_task, "wifi_task", 1024 * 4, NULL, 5, NULL);
 
     while (1)
