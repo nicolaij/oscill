@@ -14,7 +14,11 @@
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 
+#include "soc/lldesc.h"
+
 #include "main.h"
+
+#include "esp_log.h"
 
 #define DEFAULT_VREF 1100 // Use adc2_vref_to_gpio() to obtain a better estimate
 #define NO_OF_SAMPLES 64  // Multisampling
@@ -93,73 +97,78 @@ void adc1_task(void *arg)
     }
 }
 
-void isr_adc(void *z)
-{
-    ets_printf("ADC INTR\n");
-
-    adc_digi_intr_clear(ADC_UNIT_1, ADC_DIGI_INTR_MASK_MONITOR);
-}
-
 void adc_dma_task(void *arg)
 {
 
-    //  controller_clk = (APLL or APB) / (div_num + div_a / div_b + 1).
-    adc_digi_clk_t adc_clk = {.use_apll = false, //!< true: use APLL clock; false: use APB clock.
-                              .div_num = 9,      //!< Division factor. Range: 0 ~ 255.
-                                                 // Note: When a higher frequency clock is used (the division factor is less than 9),
-                                                 // the ADC reading value will be slightly offset.
-                              .div_b = 1,        //!< Division factor. Range: 1 ~ 63.
-                              .div_a = 0};       //!< Division factor. Range: 0 ~ 63.
+    adc_digi_init_config_t adc_dma_config = {
+        .max_store_buf_size = 1024,
+        .conv_num_each_intr = 256,
+        .adc1_chan_mask = BIT(ADC1_CHANNEL_2),
+        .adc2_chan_mask = BIT(ADC2_CHANNEL_0),
+    };
+    ESP_ERROR_CHECK(adc_digi_initialize(&adc_dma_config));
 
-    adc_digi_pattern_table_t adc1_pattern = {
-        .atten = ADC_ATTEN_DB_11,   /*!< ADC sampling voltage attenuation configuration. */
-        .channel = ADC1_CHANNEL_8}; /*!< ADC channel index. */
+    adc_digi_configuration_t dig_cfg = {
+        .conv_limit_en = 0,
+        .conv_limit_num = 250,
+        .sample_freq_hz = 1 * 1000,
+        .conv_mode = ADC_CONV_BOTH_UNIT,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2,
+    };
 
-    adc_digi_config_t adc_config = {.conv_limit_en = false,        /*!<Enable the function of limiting ADC conversion times.
-                                                                  If the number of ADC conversion trigger count is equal to the `limit_num`, the conversion is stopped. */
-                                    .conv_limit_num = 0,           /*!<Set the upper limit of the number of ADC conversion triggers. Range: 1 ~ 255. */
-                                    .adc1_pattern_len = 1,         /*!<Pattern table length for digital controller. Range: 0 ~ 16 (0: Don't change the pattern table setting).
-                                                                   The pattern table that defines the conversion rules for each SAR ADC. Each table has 16 items, in which channel selection,
-                                                                   resolution and attenuation are stored. When the conversion is started, the controller reads conversion rules from the
-                                                                   pattern table one by one. For each controller the scan sequence has at most 16 different rules before repeating itself. */
-                                    .adc2_pattern_len = 0,         /*!<Refer to ``adc1_pattern_len`` */
-                                    .adc1_pattern = &adc1_pattern, /*!<Pointer to pattern table for digital controller. The table size defined by `adc1_pattern_len`. */
-                                    .adc2_pattern = 0,             /*!<Refer to `adc1_pattern` */
-                                    .conv_mode = ADC_CONV_SINGLE_UNIT_1,
-                                    .format = ADC_DIGI_FORMAT_12BIT,
-                                    .interval = 40,     //!< The number of interval clock cycles for the digital controller to trigger the measurement.
-                                                        // The unit is the divided clock. Range: 40 ~ 4095.
-                                                        // Expression: `trigger_meas_freq` = `controller_clk` / 2 / interval. Refer to ``adc_digi_clk_t``.
-                                                        // Note: The sampling rate of each channel is also related to the conversion mode (See ``adc_digi_convert_mode_t``) and pattern table settings. */
-                                    .dig_clk = adc_clk, //!< ADC digital controller clock divider settings. Refer to ``adc_digi_clk_t``.
-                                                        // Note: The clocks of the DAC digital controller use the ADC digital controller clock divider.
-                                    .dma_eof_num = 64}; //!< DMA eof num of adc digital controller.
-                                                        // If the number of measurements reaches `dma_eof_num`, then `dma_in_suc_eof` signal is generated in DMA.
-                                                        // Note: The converted d}
+    adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
+    dig_cfg.pattern_num = 2;
 
-    //Configura o modo monitor (Threshold) ao ADC via DMA
-    adc_digi_monitor_t mcfg;
-    mcfg.adc_unit = ADC_UNIT_1;
-    mcfg.channel = ADC_CHANNEL_MAX;
-    mcfg.mode = ADC_DIGI_MONITOR_LOW; //Gera interrupcao quando HIGH ou LOW
-    mcfg.threshold = 2048; //Valor limite para gerar interrupcao
+    adc_pattern[0].atten = ADC_ATTEN_DB_0;
+    adc_pattern[0].channel = ADC1_CHANNEL_2;
+    adc_pattern[0].unit = unit;
+    adc_pattern[0].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
 
-    //Habilita o modo digital ao ADC
-    ESP_ERROR_CHECK(adc_digi_init());
-    ESP_ERROR_CHECK(adc_digi_controller_config(&adc_config));
-    
-    //Habilita o modo monitor ao ADC
-    ESP_ERROR_CHECK(adc_digi_monitor_set_config(ADC_DIGI_MONITOR_IDX0, &mcfg));
-    ESP_ERROR_CHECK(adc_digi_monitor_enable(ADC_DIGI_MONITOR_IDX0, true));
+    adc_pattern[1].atten = ADC_ATTEN_DB_0;
+    adc_pattern[1].channel = ADC1_CHANNEL_2;
+    adc_pattern[1].unit = unit;
+    adc_pattern[1].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
 
-    //Configura ISR ao modo monitor
-    ESP_ERROR_CHECK(adc_digi_isr_register(isr_adc, NULL, 0));
-    ESP_ERROR_CHECK(adc_digi_intr_enable(ADC_UNIT_1, ADC_DIGI_INTR_MASK_MONITOR));
+    dig_cfg.adc_pattern = adc_pattern;
+    ESP_ERROR_CHECK(adc_digi_controller_configure(&dig_cfg));
+
     ESP_ERROR_CHECK(adc_digi_start());
+    esp_err_t ret;
+    uint32_t ret_num = 0;
+    uint8_t result[256] = {0};
 
     while (1)
     {
-        ESP_LOGI("main", "teste");
+        ret = adc_digi_read_bytes(result, 256, &ret_num, ADC_MAX_DELAY);
+        if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE)
+        {
+            if (ret == ESP_ERR_INVALID_STATE)
+            {
+                /**
+                 * @note 1
+                 * Issue:
+                 * As an example, we simply print the result out, which is super slow. Therefore the conversion is too
+                 * fast for the task to handle. In this condition, some conversion results lost.
+                 *
+                 * Reason:
+                 * When this error occurs, you will usually see the task watchdog timeout issue also.
+                 * Because the conversion is too fast, whereas the task calling `adc_digi_read_bytes` is slow.
+                 * So `adc_digi_read_bytes` will hardly block. Therefore Idle Task hardly has chance to run. In this
+                 * example, we add a `vTaskDelay(1)` below, to prevent the task watchdog timeout.
+                 *
+                 * Solution:
+                 * Either decrease the conversion speed, or increase the frequency you call `adc_digi_read_bytes`
+                 */
+                break;
+            }
+
+            ESP_LOGI("TASK:", "ret is %x, ret_num is %d", ret, ret_num);
+        }
+    }
+
+    while (1)
+    {
+        ESP_LOGI("main", "exit");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
