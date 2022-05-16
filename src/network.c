@@ -24,6 +24,8 @@
 
 #include "esp_sntp.h"
 
+#include "d3.min.js.h"
+
 /* The examples use WiFi configuration that you can set via project configuration menu
 
    If you'd rather not, just change the below entries to strings with
@@ -206,6 +208,7 @@ static esp_err_t settings_handler(httpd_req_t *req)
     const char *head = "<!DOCTYPE html><html><head>"
                        "<meta http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\">"
                        "<meta name=\"viewport\" content=\"width=device-width\">"
+                       "<script src=\"/d3.min.js\"></script>"
                        "<title>Settings</title></head><body>";
 
     const char *tail = "<p><a href=\"/d\">Буфер данных</a></p>"
@@ -309,6 +312,14 @@ static void ws_async_send(char *msg)
     httpd_ws_send_frame_async(ws_hd, ws_fd, &ws_pkt);
 }
 
+static esp_err_t d3_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_send(req, d3_min_js, sizeof(d3_min_js));
+    return ESP_OK;
+};
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     uint8_t bf[128] = {0};
@@ -360,6 +371,13 @@ static const httpd_uri_t ws = {
     .user_ctx = NULL,
     .is_websocket = true};
 
+static const httpd_uri_t d3 = {
+    .uri = "/d3.min.js",
+    .method = HTTP_GET,
+    .handler = d3_handler,
+    .user_ctx = NULL,
+    .is_websocket = false};
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
@@ -375,6 +393,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_download);
+        httpd_register_uri_handler(server, &d3);
 
         ws_fd = 0;
 
