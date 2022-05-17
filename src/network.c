@@ -25,6 +25,7 @@
 #include "esp_sntp.h"
 
 #include "d3.min.js.h"
+#include "favicon.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -320,6 +321,13 @@ static esp_err_t d3_handler(httpd_req_t *req)
     return ESP_OK;
 };
 
+static esp_err_t favicon_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "image/x-icon");
+    httpd_resp_send(req, favicon_ico, favicon_ico_len);
+    return ESP_OK;
+};
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     uint8_t bf[128] = {0};
@@ -378,6 +386,13 @@ static const httpd_uri_t d3 = {
     .user_ctx = NULL,
     .is_websocket = false};
 
+static const httpd_uri_t favicon = {
+    .uri = "/favicon.ico",
+    .method = HTTP_GET,
+    .handler = favicon_handler,
+    .user_ctx = NULL,
+    .is_websocket = false};
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
@@ -394,6 +409,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &ws);
         httpd_register_uri_handler(server, &file_download);
         httpd_register_uri_handler(server, &d3);
+        httpd_register_uri_handler(server, &favicon);
 
         ws_fd = 0;
 
