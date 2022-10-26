@@ -49,9 +49,9 @@ void app_main()
     ESP_ERROR_CHECK(err);
 
     // xTaskCreate(dual_adc, "dual_adc", 1024 * 4, NULL, 6, NULL);
-    xTaskCreate(adc_dma_task, "adc_task", 1024 * 4, NULL, 5, NULL);
+    xTaskCreate(adc_dma_task, "adc_dma_task", 1024 * 5, NULL, 5, NULL);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    xTaskCreate(wifi_task, "wifi_task", 1024 * 4, NULL, 5, NULL);
+    xTaskCreate(wifi_task, "wifi_task", 1024 * 5, NULL, 5, NULL);
 
     while (1)
     {
