@@ -6,15 +6,13 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
-
 #include "main.h"
 
-#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_mac.h"
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -22,10 +20,9 @@
 
 #include <esp_http_server.h>
 
-#include "esp_sntp.h"
+#include "esp_spiffs.h"
 
-#include "d3.min.js.h"
-#include "favicon.h"
+#include "driver/uart.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -36,19 +33,25 @@
 #define CLIENT_WIFI_PASS "123123123"
 #define AP_WIFI_SSID "oscill"
 #define AP_WIFI_PASS "123123123"
-#define EXAMPLE_ESP_MAXIMUM_RETRY 0
 
-#define EXAMPLE_ESP_WIFI_CHANNEL 1
-#define EXAMPLE_MAX_STA_CONN 5
+#define STA_ESP_MAXIMUM_RETRY 3
+
+#define AP_ESP_WIFI_CHANNEL 1
+#define AP_MAX_STA_CONN 5
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
+/* esp netif object representing the WIFI station */
+static esp_netif_t *sta_netif = NULL;
 
+#define PAGE_ROOT "/"
 /* The event group allows multiple bits for each event, but we only care about two events:
  * - we are connected to the AP with an IP
  * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
+
+extern int32_t id;
 
 static const char *TAG = "wifi";
 
@@ -56,10 +59,21 @@ static const char *TAGH = "httpd";
 
 static int s_retry_num = 0;
 
-char buf[512];
+char buf[CONFIG_LWIP_TCP_MSS];
+
 size_t buf_len;
 
-bool need_ws_send;
+int64_t timeout_begin;
+
+bool need_ws_send = false;
+
+bool restart = false;
+
+typedef struct
+{
+    char filepath[32];
+    char content[32];
+} down_data_t;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -69,34 +83,35 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY)
-        {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        }
-        else
-        {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG, "connect to the AP fail");
+        wifi_event_sta_disconnected_t *sta_disconnect_evt = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGI(TAG, "wifi disconnect reason:%d", sta_disconnect_evt->reason);
+        esp_wifi_connect();
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
     {
         wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d", MAC2STR(event->mac), event->aid);
+        ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d",
+                 MAC2STR(event->mac), event->aid);
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
         wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d", MAC2STR(event->mac), event->aid);
+        ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d, reason:%d",
+                 MAC2STR(event->mac), event->aid, event->reason);
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "Station started");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
@@ -117,9 +132,9 @@ void wifi_init_softap(void)
         .ap = {
             .ssid = AP_WIFI_SSID,
             .ssid_len = strlen(AP_WIFI_SSID),
-            .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+            .channel = AP_ESP_WIFI_CHANNEL,
             .password = AP_WIFI_PASS,
-            .max_connection = EXAMPLE_MAX_STA_CONN,
+            .max_connection = AP_MAX_STA_CONN,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK},
     };
 
@@ -128,34 +143,37 @@ void wifi_init_softap(void)
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
+    static char wifi_name[32] = AP_WIFI_SSID;
+    // int l = strlen(wifi_name);
+    // itoa(id, &wifi_name[l], 10);
+
+    strlcpy((char *)wifi_config.ap.ssid, wifi_name, sizeof(wifi_config.ap.ssid));
+    wifi_config.ap.ssid_len = strlen(wifi_name);
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d", AP_WIFI_SSID, AP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d", AP_WIFI_SSID, AP_WIFI_PASS, AP_ESP_WIFI_CHANNEL);
 }
 
-int wifi_init_sta(void)
+esp_err_t wifi_init_sta(void)
 {
+    esp_err_t ret_value = ESP_OK;
 
-    esp_netif_create_default_wifi_sta();
+    ESP_ERROR_CHECK(esp_netif_init());
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
 
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = CLIENT_WIFI_SSID,
@@ -164,12 +182,8 @@ int wifi_init_sta(void)
              * However these modes are deprecated and not advisable to be used. Incase your Access point
              * doesn't support WPA2, these mode can be enabled by commenting below line */
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-
-            .pmf_cfg = {
-                .capable = true,
-                .required = false},
-        }};
-
+        },
+    };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -188,109 +202,88 @@ int wifi_init_sta(void)
      * happened. */
     if (bits & WIFI_CONNECTED_BIT)
     {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", CLIENT_WIFI_SSID, CLIENT_WIFI_PASS);
-        return 1;
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+                 CLIENT_WIFI_SSID, CLIENT_WIFI_PASS);
     }
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s", CLIENT_WIFI_SSID, CLIENT_WIFI_PASS);
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+                 CLIENT_WIFI_SSID, CLIENT_WIFI_PASS);
+        ret_value = ESP_FAIL;
     }
     else
     {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ret_value = ESP_ERR_INVALID_STATE;
     }
 
-    return 0;
+    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
+    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
+    vEventGroupDelete(s_wifi_event_group);
+    return ret_value;
 }
 
-/* An HTTP GET handler */
-static esp_err_t settings_handler(httpd_req_t *req)
-{
-    const char *head = "<!DOCTYPE html><html><head>"
-                       "<meta http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\">"
-                       "<meta name=\"viewport\" content=\"width=device-width\">"
-                       "<script src=\"/d3.min.js\"></script>"
-                       "<title>Settings</title></head><body>";
-
-    const char *tail = "<p><a href=\"/d\">Буфер данных</a></p>"
-                       "<p><textarea id=\"text\" style=\"width:98\%;height:400px;\"></textarea></p>\n"
-                       "<script>var socket = new WebSocket(\"ws://\" + location.host + \"/ws\");\n"
-                       "socket.onopen = function(){socket.send(\"open ws\");};\n"
-                       "socket.onmessage = function(e){document.getElementById(\"text\").value += e.data + \"\\n\";}"
-                       "</script>"
-                       "</body></html>";
-
-    char param[32];
-
-    /* Read URL query string length and allocate memory for length + 1,
-     * extra byte for null termination */
-    buf_len = httpd_req_get_url_query_len(req) + 1;
-    if (buf_len > 1 && buf_len < sizeof(buf))
-    {
-        // buf = malloc(buf_len);
-        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
-        {
-            ESP_LOGI(TAGH, "Found URL query => %s", buf);
-        }
-    }
-
-    httpd_resp_sendstr_chunk(req, head);
-
-    httpd_resp_sendstr_chunk(req, tail);
-    /* Send empty chunk to signal HTTP response completion */
-    httpd_resp_sendstr_chunk(req, NULL);
-
-    return ESP_OK;
-}
-
-/* Handler to download a file kept on the server */
 static esp_err_t download_get_handler(httpd_req_t *req)
 {
-    char line[128];
-    char header[96] = "attachment; filename=\"";
+    char *filepath = ((down_data_t *)(req->user_ctx))->filepath;
+    FILE *fd = NULL;
+    struct stat file_stat;
 
-    // strlcat(header, line, sizeof(header));
-    strlcat(header, "ADCdata.txt\"", sizeof(header));
+    if (stat(filepath, &file_stat) == -1)
+    {
+        ESP_LOGE(TAG, "Failed to stat file : %s", filepath);
+        /* Respond with 404 Not Found */
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File does not exist");
+        return ESP_FAIL;
+    }
 
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_set_hdr(req, "Content-Disposition", header);
-    uint8_t *ptr_adc = 0;
-    /*
-        buf[0] = 0;
-        int l = 0;
-        int n = 0;
-        while (getADC_Data(line, &ptr_adc, &n) > 0)
+    fd = fopen(filepath, "r");
+    if (!fd)
+    {
+        ESP_LOGE(TAG, "Failed to read existing file : %s", filepath);
+        /* Respond with 500 Internal Server Error */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to read existing file");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Sending file : %s (%ld bytes)...", filepath, file_stat.st_size);
+
+    httpd_resp_set_type(req, ((down_data_t *)(req->user_ctx))->content);
+    int l = strlen(filepath);
+    if (filepath[l - 3] == '.' && filepath[l - 2] == 'g' && filepath[l - 1] == 'z')
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+
+    size_t chunksize;
+    int n = 0;
+    do
+    {
+        // memset(buf, 0, sizeof(buf));
+        chunksize = fread(buf, 1, sizeof(buf), fd);
+        // printf("fread %d\n", chunksize);
+
+        if (chunksize > 0)
         {
-            l = strlcat(buf, line, sizeof(buf));
-            if (l > (sizeof(buf) - sizeof(line)))
+            /* Send the buffer contents as HTTP response chunk */
+            if (httpd_resp_send_chunk(req, buf, chunksize) != ESP_OK)
             {
-                if (httpd_resp_send_chunk(req, buf, l) != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "File sending failed!");
-                    httpd_resp_sendstr_chunk(req, NULL);
-                    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
-                    return ESP_FAIL;
-                }
-
-                buf[0] = 0;
-                l = 0;
-            }
-
-            if (n % 1000 == 0)
-            {
-                vTaskDelay(1);
+                fclose(fd);
+                ESP_LOGE(TAG, "File %s sending failed!", filepath);
+                /* Abort sending file */
+                httpd_resp_sendstr_chunk(req, NULL);
+                /* Respond with 500 Internal Server Error */
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to send file");
+                return ESP_FAIL;
             }
         }
+    } while (chunksize != 0);
 
-        if (l > 0)
-        {
-            httpd_resp_send_chunk(req, buf, l);
-        }
-    */
-    /* Respond with an empty chunk to signal HTTP response completion */
-    httpd_resp_send_chunk(req, NULL, 0);
+    /* Close file after sending complete */
+    fclose(fd);
+    // ESP_LOGI(TAG, "File sending complete");
+
+    httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
-}
+};
 
 httpd_handle_t ws_hd;
 int ws_fd = 0;
@@ -302,9 +295,7 @@ static void ws_async_send(char *msg)
 {
     if (ws_fd == 0)
         return;
-
     httpd_ws_frame_t ws_pkt;
-
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.payload = (uint8_t *)msg;
     ws_pkt.len = strlen(msg);
@@ -313,64 +304,44 @@ static void ws_async_send(char *msg)
     httpd_ws_send_frame_async(ws_hd, ws_fd, &ws_pkt);
 }
 
-static esp_err_t d3_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "application/javascript");
-    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-    httpd_resp_send(req, d3_min_js, sizeof(d3_min_js));
-    return ESP_OK;
-};
-
-static esp_err_t favicon_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "image/x-icon");
-    httpd_resp_send(req, favicon_ico, favicon_ico_len);
-    return ESP_OK;
-};
-
 static esp_err_t ws_handler(httpd_req_t *req)
 {
-    uint8_t bf[128] = {0};
+    if (req->method == HTTP_GET)
+    {
+        ESP_LOGI(TAG, "WS handshake done, the new connection was opened");
+        return ESP_OK;
+    }
+
+    uint8_t bf[160] = {0};
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.payload = bf;
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 128);
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(bf));
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAGH, "httpd_ws_recv_frame failed with %d", ret);
         return ret;
     }
-    ESP_LOGI(TAGH, "Got packet with message: %s", ws_pkt.payload);
+    ESP_LOGI(TAGH, "Got packet with message: \"%s\"", ws_pkt.payload);
     ESP_LOGI(TAGH, "Packet type: %d", ws_pkt.type);
 
     ws_hd = req->handle;
-    ESP_LOGI(TAGH, "ws_hd: %d", *(int *)ws_hd);
     ws_fd = httpd_req_to_sockfd(req);
-    ESP_LOGI(TAGH, "ws_fd: %d", ws_fd);
+    ESP_LOGI(TAGH, "ws_hd/fd: %d/%d", *(int *)ws_hd, ws_fd);
 
     if (strcmp("open ws", (const char *)ws_pkt.payload) == 0)
-    {
-        bool need_ws_send = true;
-    }
+        need_ws_send = true;
 
     return ret;
 }
 
-/* URI handler for getting uploaded files */
-static const httpd_uri_t file_download = {
-    .uri = "/d",
-    .method = HTTP_GET,
-    .handler = download_get_handler,
-};
-
 static const httpd_uri_t root = {
     .uri = "/",
     .method = HTTP_GET,
-    .handler = settings_handler,
-    /* Let's pass response string in user
-     * context to demonstrate it's usage */
-    .user_ctx = "Hello World!"};
+    .handler = download_get_handler,
+    .user_ctx = &((down_data_t){.filepath = "/spiffs/index.html", .content = "text/html"}),
+    .is_websocket = false};
 
 static const httpd_uri_t ws = {
     .uri = "/ws",
@@ -379,25 +350,30 @@ static const httpd_uri_t ws = {
     .user_ctx = NULL,
     .is_websocket = true};
 
-static const httpd_uri_t d3 = {
-    .uri = "/d3.min.js",
+static const httpd_uri_t d3_get = {
+    .uri = "/d3",
     .method = HTTP_GET,
-    .handler = d3_handler,
-    .user_ctx = NULL,
+    .handler = download_get_handler,
+    .user_ctx = &((down_data_t){.filepath = "/spiffs/D3.html", .content = "text/html"}),
     .is_websocket = false};
 
-static const httpd_uri_t favicon = {
-    .uri = "/favicon.ico",
+static const httpd_uri_t d3_get_gz = {
+    .uri = "/d3.min.js",
     .method = HTTP_GET,
-    .handler = favicon_handler,
-    .user_ctx = NULL,
+    .handler = download_get_handler,
+    .user_ctx = &((down_data_t){.filepath = "/spiffs/d3.min.js.gz", .content = "application/javascript"}),
     .is_websocket = false};
 
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    // config.max_open_sockets = 2;
+    // config.stack_size = 1024 * 10;
     config.lru_purge_enable = true;
+    // config.send_wait_timeout = 30;
+    // config.recv_wait_timeout = 30;
+    // config.task_priority = 6;
 
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -407,9 +383,8 @@ static httpd_handle_t start_webserver(void)
         ESP_LOGI(TAG, "Registering URI handlers");
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &ws);
-        httpd_register_uri_handler(server, &file_download);
-        httpd_register_uri_handler(server, &d3);
-        httpd_register_uri_handler(server, &favicon);
+        httpd_register_uri_handler(server, &d3_get);
+        httpd_register_uri_handler(server, &d3_get_gz);
 
         ws_fd = 0;
 
@@ -420,65 +395,102 @@ static httpd_handle_t start_webserver(void)
     return NULL;
 }
 
-void time_sync_notification_cb(struct timeval *tv)
-{
-    char strftime_buf[64];
-    time_t now = tv->tv_sec;
-    struct tm timeinfo = {0};
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(TAG, "The current date/time in Minks is: %s", strftime_buf);
-    ESP_LOGI(TAG, "Notification of a time synchronization event");
-}
-
 void wifi_task(void *arg)
 {
+    ESP_LOGI("SPIFFS", "Initializing SPIFFS");
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true};
 
-    char msg[256];
+    // Use settings defined above to initialize and mount SPIFFS filesystem.
+    // Note: esp_vfs_spiffs_register is an all-in-one convenience function.
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
 
-    ws_send_queue = xQueueCreate(32, sizeof(msg));
-
-    // Set timezone to BY
-    setenv("TZ", "UTC-3", 1);
-    tzset();
-
-    s_wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    if (wifi_init_sta())
+    if (ret != ESP_OK)
     {
-        ESP_LOGI(TAG, "Initializing SNTP");
-        sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        sntp_setservername(0, "by.pool.ntp.org");
-        sntp_setservername(1, "time.windows.com");
-        sntp_set_time_sync_notification_cb(time_sync_notification_cb);
-        sntp_init();
+        if (ret == ESP_FAIL)
+        {
+            ESP_LOGE("SPIFFS", "Failed to mount or format filesystem");
+        }
+        else if (ret == ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGE("SPIFFS", "Failed to find SPIFFS partition");
+        }
+        else
+        {
+            ESP_LOGE("SPIFFS", "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(conf.partition_label, &total, &used);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE("SPIFFS", "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
     }
     else
     {
-        wifi_init_softap();
+        ESP_LOGI("SPIFFS", "Partition size: total: %d, used: %d", total, used);
     }
+
+    int wifi_on = 1;
+
+    esp_err_t e = wifi_init_sta();
+    // if (e == ESP_OK)
+    // vTaskDelay(5000 / portTICK_PERIOD_MS);
+    // else
+    //     wifi_init_softap();
 
     /* Start the server for the first time */
     start_webserver();
 
+    uint32_t ret_num = 0;
+    uint8_t buffer_adc_data[BLOCK];
+
+    uint32_t sum = 0;
+    uint32_t num = 0;
+
     while (1)
     {
-
-        if (pdTRUE == xQueueReceive(ws_send_queue, msg, 1000 / portTICK_PERIOD_MS))
+        ret = 0;
+        if ((ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) && ret_num > 0)
         {
-            need_ws_send = true;
-        }
+            if (ws_fd > 0)
+            {
+                httpd_ws_frame_t ws_pkt = {
+                    .final = true,
+                    .fragmented = false,
+                    .payload = buffer_adc_data,
+                    .len = ret_num,
+                    .type = HTTPD_WS_TYPE_BINARY,
+                };
+                httpd_ws_send_frame_async(ws_hd, ws_fd, &ws_pkt);
+            }
+            /*
+                        adc_digi_output_data_t *p = (void *)buffer_adc_data;
 
-        if (need_ws_send && ws_fd > 0)
+                        while ((uint8_t *)p < buffer_adc_data + ret_num)
+                        {
+                            sum += p->type1.data;
+                            num++;
+                            if (num == 10)
+                            {
+                                uint8_t r = (sum / num) >> (12 - 5);
+                                xQueueSend(ui_queue, &r, 0);
+                                num = 0;
+                                sum = 0;
+                            }
+                            p++;
+                        }*/
+        };
+
+        if (restart == true)
         {
-            httpd_queue_work(ws_hd, ws_async_send, msg);
-            need_ws_send = false;
+            esp_wifi_stop();
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            esp_restart();
         }
 
         vTaskDelay(1);

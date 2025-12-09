@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>Real Time Chart</title>
+  <script src="d3.min.js"></script>
+</head>
+
+<body>
+
+  <div>
+
+    <input id="halt" type="checkbox" name="halt" value="halt" style="margin-bottom: 10px; margin-left: 40px;" /> Halt
+    &nbsp;&nbsp;&nbsp;&nbsp;View:<input id="view" type="number" name="view" value="1000" step="100" min="100"
+      style="width: 4em;margin-bottom: 10px;" />ms
+    &nbsp;&nbsp;&nbsp;&nbsp;Data time:<input id="datasize" type="number" name="datasize" value="60" step="10" min="10"
+      style="width: 4em; margin-bottom: 10px;" />s
+    &nbsp;&nbsp;&nbsp;
+    &nbsp;<input id="scaleup" type="button" name="scaleup" value="Y +" style="width: 4em; margin-bottom: 10px;" />
+    &nbsp;<input id="scaleres" type="button" name="scaleres" value="R" style="width: 2em; margin-bottom: 10px;" />
+    &nbsp;<input id="scaledown" type="button" name="scaledown" value="Y -" style="width: 4em; margin-bottom: 10px;" />
+
+    <div id="viewDiv"></div>
+
+  </div>
+
+  <script>
+
+    const formatMillisecond = d3.timeFormat(".%L"),
+      formatSecond = d3.timeFormat(":%S"),
+      formatMinute = d3.timeFormat("%H:%M"),
+      formatHour = d3.timeFormat("%H"),
+      formatDay = d3.timeFormat("%a %d"),
+      formatWeek = d3.timeFormat("%b %d"),
+      formatMonth = d3.timeFormat("%B"),
+      formatYear = d3.timeFormat("%Y");
+
+    function multiFormat(date) {
+      return (d3.timeSecond(date) < date ? formatMillisecond
+        : d3.timeMinute(date) < date ? formatSecond
+          : d3.timeHour(date) < date ? formatMinute
+            : d3.timeDay(date) < date ? formatHour
+              : d3.timeMonth(date) < date ? (d3.timeWeek(date) < date ? formatDay : formatWeek)
+                : d3.timeYear(date) < date ? formatMonth
+                  : formatYear)(date);
+    }
+
+    const margin = { top: 20, right: 20, bottom: 30, left: 40 };
+    const height = window.innerHeight / 2;
+    const width = window.innerWidth - margin.left - margin.right - 40;
+    const focusHeight = 100;
+
+    var tm = new Date().getTime();
+    //var tm = new Date('2022-11-09 00:00:00');
+
+    var datasize = 60;
+    var view = 1000;
+    var sourcedata = [];
+    var avgdata = [];
+    var ymax = 1;
+    const freq = 1000; // количество данных в секунду
+
+    function datagen(count) {
+      let t = tm - count * 1000 / freq;
+      for (let i = 1; i <= count; i++) {
+        let v = 0;
+        if (i < 300)
+          v = i - 1;
+        else if (i > 600)
+          v = 900 - i - 1;
+        else if (i > 300)
+          v = 600 - i - 1;
+
+        let o = {
+          date: t + i * 1000 / freq,
+          val: v
+        }
+        sourcedata.push(o);
+      }
+    }
+
+    //datagen(900);
+
+    //setTimeout(() => { sourcedata.push(Math.round(Math.random() * 300)) }, 1000 / freq);
+    //d3.interval(() => { sourcedata.push(Math.round(Math.random() * 300)) }, 1000 / freq);
+
+    // compute initial time domains...
+
+    var halt = false;
+
+    var tmstart = tm;
+    // define main chart scales
+    var x = d3.scaleTime().domain([tmstart, tm]).range([0, width]);
+    var xNav = d3.scaleTime().domain([tmstart, tm]).range([0, width]);
+    var y = d3.scaleLinear().domain([0, ymax]).range([height, 0]);
+    var yNav = d3.scaleLinear().domain([0, ymax]).range([focusHeight, 0]);
+
+    // append the svg object to the body of the page
+    var svg = d3.select("#viewDiv")
+      .append("svg")
+      .attr("width", width + margin.left + margin.right)
+      .attr("height", height + margin.top + margin.bottom)
+      .append("g")
+      .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+    svg.append("g")
+      .attr("class", "x-axis")
+      .attr("transform", "translate(0," + height + ")")
+      .call(d3.axisBottom(x).tickFormat(multiFormat));
+
+    svg.append("g")
+      .attr("class", "y-axis")
+      .call(d3.axisLeft(y));
+
+    const line = d3.line()
+      //  .curve(d3.curveBasis)
+      .x((i) => x(i.date))
+      .y((i) => y(i.val));
+
+    // Add the line
+    svg.append("path")
+      .datum(sourcedata)
+      .attr("class", "line")
+      .attr("fill", "none")
+      .attr("stroke", "steelblue")
+      .attr("stroke-width", 1.5)
+      .attr("d", line);
+
+    //viewport
+    var svg2 = d3.select("#viewDiv")
+      .append("svg")
+      .attr("width", width + margin.left + margin.right)
+      .attr("height", focusHeight + margin.bottom)
+      .append("g")
+      .attr("transform", "translate(" + margin.left + "," + 0 + ")");
+
+    svg2.append("g")
+      .attr("class", "x-axis")
+      .attr("transform", "translate(0," + focusHeight + ")")
+      .call(d3.axisBottom(x).tickFormat(multiFormat));
+
+    const lineviewport = d3.area()
+      .x((i) => xNav(i.date))
+      .y0(yNav(0))
+      .y1((i) => yNav(i.val));
+
+    svg2.append("path")
+      .attr("class", "path")
+      .datum(sourcedata)
+      .attr("fill", "steelblue")
+      .attr("d", lineviewport);
+
+    const brush = d3.brushX()
+      .extent([[0, 0], [width, focusHeight]])
+      .on("brush", brushed)
+      .on("end", brushended);
+
+    svg2.append("g")
+      .attr("class", "brush")
+      .call(brush)
+
+    function brushed({ selection }) {
+      if (selection) {
+        x.domain(selection.map(d => xNav.invert(d)))
+        update();
+      }
+      //console.log(selection);
+      //console.log(xNav.invert(selection[1]));
+    }
+
+    function brushended({ selection }) {
+      if (!selection) {
+        svg2.select(".brush")
+          .call(brush.move, [xNav(xNav.domain()[1].getTime() - view), xNav.range()[1]]);
+      }
+    }
+
+    function updateNav(tm) {
+      //tm = new Date().getTime();
+      //tm = new Date('2022-11-09 00:00:00');
+      //xNav = d3.scaleTime().domain([tmstart, tm]).range([0, width]);
+      xNav.domain([sourcedata[0].date, tm]);
+
+      svg2.select(".x-axis")
+        //.transition().duration(200)
+        .call(d3.axisBottom(xNav).tickFormat(multiFormat));
+
+      svg2.select(".path")
+        //.transition().duration(200)
+        .attr("d", lineviewport);
+    };
+
+    function update() {
+      //x = d3.scaleTime().domain([tmstart, tm]).range([0, width]);
+      svg.select(".x-axis")
+        //.transition().duration(200)
+        .call(d3.axisBottom(x).tickFormat(multiFormat));
+
+      svg.select(".line")
+        //.transition().duration(200)
+        .attr("d", line);
+    };
+
+    function yscale(ymax) {
+      if (ymax > 4090)
+        ymax = 4090;
+
+      if (ymax < 1)
+        ymax = 1;
+
+      y.domain([0, ymax]);
+
+      svg.select(".y-axis")
+        .call(d3.axisLeft(y));
+
+      yNav.domain([0, ymax]);
+
+      return ymax;
+    }
+
+    // event handler for halt checkbox
+    d3.select("#halt").on("change", function () {
+      halt = d3.select(this).property("checked")
+    })
+    d3.select("#view").on("change", function () {
+      view = d3.select(this).property("value")
+    })
+    d3.select("#datasize").on("change", function () {
+      datasize = d3.select(this).property("value")
+    })
+    d3.select("#scaleup").on("click", function () {
+      ymax = yscale(ymax * 2);
+    })
+    d3.select("#scaleres").on("click", function () {
+      ymax = 1;
+    })
+    d3.select("#scaledown").on("click", function () {
+      ymax = yscale(ymax / 3);
+    })
+
+    var socket = new WebSocket("ws://" + location.host + "/ws");
+    socket.binaryType = "arraybuffer";
+    socket.onopen = function (e) {
+      socket.send("Open");
+    };
+
+    var haltsw = false;
+
+    socket.onmessage = function (e) {
+      if (halt) {
+        haltsw = true;
+        return;
+      }
+      tm = Date.now();
+      let o = {};
+      if (e.data instanceof ArrayBuffer) {
+        // binary frame
+        let d = new Uint16Array(e.data);
+        let t = tm - (d.byteLength / 2) * 1000 / freq;
+        if (sourcedata.length > 0 && haltsw == false) {
+          t = sourcedata[sourcedata.length - 1].date + 1000 / freq;;
+        }
+        if (haltsw == true) {
+          //урезаем массив данных
+          let i = 0;
+          for (const value of sourcedata) {
+            if (value.date > tm - datasize * 1000)
+              break;
+            i++;
+          }
+          sourcedata.slice(i);
+          haltsw = false;
+        }
+        let i = 0;
+        let vmax = 1;
+        //console.log(d.count);
+        for (let v of d) {
+          o = {
+            date: t + i * 1000 / freq,
+            val: v & 0x0fff
+          }
+          if (ymax == 1) {
+            if (vmax < o.val) {
+              vmax = o.val;
+            }
+          }
+          sourcedata.push(o);
+          i++;
+          if (sourcedata[0].date < tm - datasize * 1000) sourcedata.shift();
+        }
+        if (ymax == 1) {
+          ymax = vmax;
+          yscale(ymax);
+        }
+        //console.log(sourcedata.length);
+      } else {
+        // text frame
+        console.log(e.data);
+      }
+      updateNav(o.date);
+      //update(tm);
+      brushended({});
+    }
+
+  </script>
+</body>
+
+</html>

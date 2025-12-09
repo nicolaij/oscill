@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <!-- Author: Bo Ericsson -->
+  <title>Real Time Chart</title>
+  <style>
+    .axis text {
+      font: 10px sans-serif;
+    }
+
+    .chartTitle {
+      font-size: 12px;
+      font-weight: bold;
+      text-anchor: middle;
+    }
+
+    .axis .title {
+      font-weight: bold;
+      text-anchor: middle;
+    }
+
+    .axis path,
+    .axis line {
+      fill: none;
+      stroke: #000;
+      shape-rendering: crispEdges;
+    }
+
+    .x.axis path {
+      fill: none;
+      stroke: #000;
+      shape-rendering: crispEdges;
+    }
+
+    .nav .area {
+      fill: lightgrey;
+      stroke-width: 0px;
+    }
+
+    .nav .line {
+      fill: none;
+      stroke: darkgrey;
+      stroke-width: 1px;
+    }
+
+    .viewport {
+      stroke: grey;
+      fill: black;
+      fill-opacity: 0.3;
+    }
+
+    .viewport .extent {
+      fill: green;
+    }
+
+    .well {
+      padding-top: 0px;
+      padding-bottom: 0px;
+    }
+  </style>
+  <script src="d3.min.js"></script>
+</head>
+
+<body>
+
+  <div style="padding: 10px">
+
+    <input id="halt" type="checkbox" name="halt" value="halt" style="margin-bottom: 10px" /> Halt
+    <div id="viewDiv"></div>
+
+  </div>
+
+  <script>
+    // mean and deviation for time interval
+    var meanMs = 1000, // milliseconds
+      dev = 150;
+
+    // define time scale
+    var timeScale = d3.scaleLinear()
+      .domain([300, 1700])
+      .range([300, 1700])
+      .clamp(true);
+
+    // define value scale
+    var valueScale = d3.scaleLinear()
+      .domain([0, 1])
+      .range([30, 95]);
+
+    // generate initial data
+    var normal = d3.randomNormal(1000, 150);
+    var currMs = new Date().getTime() - 300000 - 4000;
+    var data = d3.range(300).map(function (d, i, arr) {
+      var value = valueScale(Math.random()); // random data
+      //var value = Math.round((d % 60) / 60 * 95); // ramp data
+      var interval = Math.round(timeScale(normal()));
+      currMs += interval;
+      var time = new Date(currMs);
+      var obj = { interval: interval, value: value, time: time, ts: currMs }
+      return obj;
+    })
+
+    // create the real time chart
+    var chart = realTimeChart()
+      .title("Chart Title")
+      .yTitle("Y Scale")
+      .xTitle("X Scale")
+      .border(true)
+      .width(800)
+      .height(400)
+      .barWidth(1)
+      .initialData(data);
+
+    console.log("Version: ", chart.version);
+    console.dir("Dir++");
+    console.trace();
+    console.warn("warn")
+
+    // invoke the chart
+    var chartDiv = d3.select("#viewDiv").append("div")
+      .attr("id", "chartDiv")
+      .call(chart);
+
+    // Event handler for halt checkbox
+    d3.select("#halt").on("change", function () {
+      var state = d3.select(this).property("checked")
+      chart.halt(state);
+    })
+
+    // drive data into the chart roughly every second
+    // in a normal use case, real time data would arrive through the network or some other mechanism
+    var d = 0;
+    function dataGenerator() {
+
+      var timeout = Math.round(timeScale(normal()));
+
+      setTimeout(function () {
+
+        // create new data item
+        var now = new Date();
+        var obj = {
+          value: valueScale(Math.random()), // random data
+          //value: Math.round((d++ % 60) / 60 * 95), // ramp data
+          time: now,
+          color: "red",
+          ts: now.getTime(),
+          interval: timeout
+        };
+
+        // send the datum to the chart
+        chart.datum(obj);
+
+        // do forever
+        dataGenerator();
+
+      }, timeout);
+    }
+
+    // start the data generator
+    dataGenerator();
+
+    function realTimeChart() {
+
+      var version = "0.1.0",
+        datum, initialData, data,
+        maxSeconds = 300, pixelsPerSecond = 10,
+        svgWidth = 800, svgHeight = 300,
+        margin = { top: 20, bottom: 20, left: 50, right: 30, topNav: 10, bottomNav: 20 },
+        dimension = { chartTitle: 20, xAxis: 20, yAxis: 20, xTitle: 20, yTitle: 20, navChart: 70 },
+        barWidth = 3,
+        maxY = 100, minY = 0,
+        chartTitle, yTitle, xTitle,
+        drawXAxis = true, drawYAxis = true, drawNavChart = true,
+        border,
+        selection,
+        halted = false,
+        barId = 0;
+
+      // create the chart
+      var chart = function (s) {
+        selection = s;
+        if (selection === undefined) {
+          console.error('selection is undefined');
+          return;
+        }
+        // process titles
+        chartTitle = chartTitle || "";
+        xTitle = xTitle || "";
+        yTitle = yTitle || "";
+
+        // compute component dimensions
+        var chartTitleDim = chartTitle == "" ? 0 : dimension.chartTitle;
+        var xTitleDim = xTitle == "" ? 0 : dimension.xTitle;
+        var yTitleDim = yTitle == "" ? 0 : dimension.yTitle;
+        var xAxisDim = !drawXAxis ? 0 : dimension.xAxis;
+        var yAxisDim = !drawYAxis ? 0 : dimension.yAxis;
+        var navChartDim = !drawNavChart ? 0 : dimension.navChart;
+
+        // compute chart dimension and offset
+        var marginTop = margin.top + chartTitleDim;
+        var height = svgHeight - marginTop - margin.bottom - chartTitleDim - xTitleDim - xAxisDim - navChartDim + 30;
+        var heightNav = navChartDim - margin.topNav - margin.bottomNav;
+        var marginTopNav = svgHeight - margin.bottom - heightNav - margin.topNav;
+        var width = svgWidth - margin.left - margin.right;
+        var widthNav = width;
+
+        const svg = selection.append("svg")
+          .attr("width", svgWidth)
+          .attr("height", svgHeight)
+          .style("display", "block")
+          .style("border", function (d) {
+            if (border) return "1px solid lightgray";
+            else return null;
+          });
+
+        // create main group and translate
+        var main = svg.append("g")
+          .attr("transform", "translate (" + margin.left + "," + marginTop + ")");
+
+        // define clip-path
+        main.append("defs").append("clipPath")
+          .attr("id", "myClip")
+          .append("rect")
+          .attr("x", 0)
+          .attr("y", 0)
+          .attr("width", width)
+          .attr("height", height);
+
+        // create chart background
+        main.append("rect")
+          .attr("x", 0)
+          .attr("y", 0)
+          .attr("width", width)
+          .attr("height", height)
+          .style("fill", "#f5f5f5");
+
+        // note that two groups are created here, the latter assigned to barG;
+        // the former will contain a clip path to constrain objects to the chart area; 
+        // no equivalent clip path is created for the nav chart as the data itself
+        // is clipped to the full time domain
+        var barG = main.append("g")
+          .attr("class", "barGroup")
+          .attr("transform", "translate(0, 0)")
+          .attr("clip-path", "url(#myClip")
+          .append("g");
+
+        // in main group, add chart title
+        main.append("text")
+          .attr("class", "chartTitle")
+          .attr("x", width / 2)
+          .attr("y", -20)
+          .attr("dy", ".71em")
+          .text(function (d) {
+            var text = chartTitle == undefined ? "" : chartTitle;
+            return text;
+          });
+
+        // define main chart axis
+        //var xAxis = d3.svg.axis().orient("bottom");
+        //var yAxis = d3.svg.axis().orient("left");
+
+        // add nav chart
+        var nav = svg.append("g")
+          .attr("transform", "translate (" + margin.left + "," + marginTopNav + ")");
+
+        // add nav background
+        nav.append("rect")
+          .attr("x", 0)
+          .attr("y", 0)
+          .attr("width", width)
+          .attr("height", heightNav)
+          .style("fill", "#F5F5F5")
+          .style("shape-rendering", "crispEdges")
+          .attr("transform", "translate(0, 0)");
+
+        // add group to hold line and area paths
+        var navG = nav.append("g")
+          .attr("class", "nav");
+
+        // compute initial time domains...
+        var ts = new Date().getTime();
+
+        // first, the full time domain
+        var endTime = new Date(ts);
+        var interval = maxSeconds * 1000;
+        var startTimeNav = new Date(ts - interval);
+        var startTime = new Date(ts - interval / 10);
+
+        // define main chart scales
+        var x = d3.scaleTime().domain([startTime, endTime]).range([0, width]);
+        var y = d3.scaleLinear().domain([minY, maxY]).range([height, 0]);
+
+        // define nav scales
+        var xNav = d3.scaleTime().domain([startTimeNav, endTime]).range([0, widthNav]);
+        var yNav = d3.scaleLinear().domain([minY, maxY]).range([heightNav, 0]);
+
+        const formatMillisecond = d3.timeFormat(".%L"),
+          formatSecond = d3.timeFormat(":%S"),
+          formatMinute = d3.timeFormat("%H:%M"),
+          formatHour = d3.timeFormat("%H"),
+          formatDay = d3.timeFormat("%a %d"),
+          formatWeek = d3.timeFormat("%b %d"),
+          formatMonth = d3.timeFormat("%B"),
+          formatYear = d3.timeFormat("%Y");
+
+        function multiFormat(date) {
+          return (d3.timeSecond(date) < date ? formatMillisecond
+            : d3.timeMinute(date) < date ? formatSecond
+              : d3.timeHour(date) < date ? formatMinute
+                : d3.timeDay(date) < date ? formatHour
+                  : d3.timeMonth(date) < date ? (d3.timeWeek(date) < date ? formatDay : formatWeek)
+                    : d3.timeYear(date) < date ? formatMonth
+                      : formatYear)(date);
+        }
+
+        // update axis with modified scale
+        var xAxis = d3.axisBottom(x).tickFormat(multiFormat);
+        var yAxis = d3.axisLeft(y);
+        var xAxisNav = d3.axisBottom(xNav).tickFormat(multiFormat);
+
+        // add group for x axis
+        var xAxisG = main.append("g")
+          .attr("class", "x axis")
+          .attr("transform", "translate(0," + height + ")")
+          .call(xAxis);
+
+        // add group for y axis
+        var yAxisG = main.append("g")
+          .attr("class", "y axis")
+          .call(yAxis);
+
+        // in x axis group, add x axis title
+        xAxisG.append("text")
+          .attr("class", "title")
+          .attr("x", width / 2)
+          .attr("y", 25)
+          .attr("dy", ".71em")
+          .text(function (d) {
+            var text = xTitle == undefined ? "" : xTitle;
+            return text;
+          });
+
+        // in y axis group, add y axis title
+        yAxisG.append("text")
+          .attr("class", "title")
+          .attr("transform", "rotate(-90)")
+          .attr("x", - height / 2)
+          .attr("y", -35)
+          .attr("dy", ".71em")
+          .text(function (d) {
+            var text = yTitle == undefined ? "" : yTitle;
+            return text;
+          });
+
+        // add group to hold nav x axis
+        var xAxisGNav = nav.append("g")
+          .attr("class", "x axis")
+          .attr("transform", "translate(0," + heightNav + ")")
+          .call(xAxisNav);
+
+
+        // define nav axis
+        //var xAxisNav = d3.svg.axis().orient("bottom");
+
+        // define function that will draw the nav area chart
+        var navArea = d3.area()
+          .x(function (d) { return xNav(d.time); })
+          .y1(function (d) { return yNav(d.value); })
+          .y0(heightNav);
+
+        // define function that will draw the nav line chart
+        var navLine = d3.line()
+          .x(function (d) { return xNav(d.time); })
+          .y(function (d) { return yNav(d.value); });
+
+        // then the viewport time domain (what's visible in the main chart 
+        // and the viewport in the nav chart)
+        //var endTimeViewport = new Date(ts);
+        //var startTimeViewport = new Date(endTime.getTime() - width / pixelsPerSecond * 1000);
+        //var intervalViewport = endTimeViewport.getTime() - startTimeViewport.getTime();
+        //var offsetViewport = startTimeViewport.getTime() - startTime.getTime();
+
+        // set the scale domains for main and nav charts
+        //x.domain([startTimeViewport, endTimeViewport]);
+        //xNav.domain([startTime, endTime]);
+
+        const viewport = d3.brushX()
+          //.extent([[margin.left, svgHeight - margin.bottom - heightNav], [margin.left + widthNav, svgHeight - margin.bottom]])
+          .extent([[0, 0], [widthNav, heightNav]])
+          .on("brush", brushed)
+          .on("end", brushended);
+
+        const defaultSelection = [xNav(x.domain()[0]), xNav.range()[1]];
+
+        function brushed({ selection }) {
+          if (selection) {
+            svg.property("value", selection.map(xNav.invert, xNav).map(d3.timeMillisecond));
+            svg.dispatch("input");
+          }
+        }
+
+        function brushended({ selection }) {
+          if (!selection) {
+            viewportG.call(viewport.move, defaultSelection);
+          }
+        }
+
+        // create group and assign to brush
+        var viewportG = nav.append("g")
+          .attr("class", "viewport")
+          .call(viewport)
+          .call(viewport.move, defaultSelection)
+        //.selectAll("rect")
+        //.attr("height", heightNav);
+
+        // initial invocation
+        data = initialData || [];
+
+        // update display
+        //refresh();
+
+
+        // function to refresh the viz upon changes of the time domain 
+        // (which happens constantly), or after arrival of new data,
+        // or at init
+        function refresh() {
+
+          // process data to remove too late or too early data items 
+          // (the latter could occur if the chart is stopped, while data
+          // is being pumped in)
+          data = data.filter(function (d) {
+            if (d.time.getTime() > startTime.getTime() &&
+              d.time.getTime() < endTime.getTime())
+              return true;
+          })
+
+          // here we bind the new data to the main chart
+          // note: no key function is used here; therefore the data binding is
+          // by index, which effectivly means that available DOM elements
+          // are associated with each item in the available data array, from 
+          // first to last index; if the new data array contains fewer elements
+          // than the existing DOM elements, the LAST DOM elements are removed;
+          // basically, for each step, the data items "walks" leftward (each data 
+          // item occupying the next DOM element to the left);
+          // This data binding is very different from one that is done with a key 
+          // function; in such a case, a data item stays "resident" in the DOM
+          // element, and such DOM element (with data) would be moved left, until
+          // the x position is to the left of the chart, where the item would be 
+          // exited
+          var updateSel = barG.selectAll(".bar")
+            .data(data);
+
+          // remove items
+          updateSel.exit().remove();
+
+          // append items
+          updateSel.enter().append("rect")
+            .attr("class", "bar")
+            .attr("id", function () {
+              return "bar-" + barId++;
+            })
+            .attr("shape-rendering", "crispEdges");
+
+          // update items
+          updateSel
+            .attr("x", function (d) { return Math.round(x(d.time) - barWidth); })
+            .attr("y", function (d) { return y(d.value); })
+            .attr("width", barWidth)
+            .attr("height", function (d) { return height - y(d.value); })
+            .style("fill", function (d) { return d.color == undefined ? "black" : d.color; })
+            //.style("stroke", "none")
+            //.style("stroke-width", "1px")
+            //.style("stroke-opacity", 0.5)
+            .style("fill-opacity", 1);
+
+          // also, bind data to nav chart
+          // first remove current paths
+          navG.selectAll("path").remove();
+
+          // then append area path...
+          navG.append('path')
+            .attr('class', 'area')
+            .attr('d', navArea(data));
+
+          // ...and line path
+          navG.append('path')
+            .attr('class', 'line')
+            .attr('d', navLine(data));
+
+        } // end refreshChart function
+
+        // function to keep the chart "moving" through time (right to left) 
+        setInterval(function () {
+          if (halted) return;
+          // get current viewport extent
+          //var extent = viewport.empty() ? xNav.domain() : viewport.extent();
+          var extent = d3.brushSelection(this) ? null : x.domain();
+          //if (!extent) extent = xNav.domain();
+          var interval = extent[1].getTime() - extent[0].getTime();
+          var offset = extent[0].getTime() - xNav.domain()[0].getTime();
+
+          // compute new nav extents
+          endTime = new Date();
+          startTime = new Date(endTime.getTime() - maxSeconds * 1000);
+
+          // compute new viewport extents 
+          startTimeViewport = new Date(startTime.getTime() + offset);
+          endTimeViewport = new Date(startTimeViewport.getTime() + interval);
+          viewport.extent([startTimeViewport, endTimeViewport])
+
+          // update scales
+          x.domain([startTimeViewport, endTimeViewport]);
+          xNav.domain([startTime, endTime]);
+
+          // update axis
+          //xAxis.scale(x)(xAxisG);
+          //xAxis = d3.axisBottom(x)(xAxisG);
+          //xAxisNav = d3.axisBottom(xNav)(xAxisGNav);
+          xAxisG.call(xAxis);
+          xAxisGNav.call(xAxisNav);
+
+          // refresh svg
+          refresh();
+
+        }, 50)
+
+        // end setInterval function
+
+        return chart;
+
+      } // end chart function
+
+
+      // chart getter/setters
+
+      // array of inital data
+      chart.initialData = function (_) {
+        if (arguments.length == 0) return initialData;
+        initialData = _;
+        return chart;
+      }
+
+      // new data item (this most recent item will appear 
+      // on the right side of the chart, and begin moving left)
+      chart.datum = function (_) {
+        if (arguments.length == 0) return datum;
+        datum = _;
+        data.push(datum);
+        return chart;
+      }
+
+      // svg width
+      chart.width = function (_) {
+        if (arguments.length == 0) return svgWidth;
+        svgWidth = _;
+        return chart;
+      }
+
+      // svg height
+      chart.height = function (_) {
+        if (arguments.length == 0) return svgHeight;
+        svgHeight = _;
+        return chart;
+      }
+
+      // svg border
+      chart.border = function (_) {
+        if (arguments.length == 0) return border;
+        border = _;
+        return chart;
+      }
+
+      // chart title
+      chart.title = function (_) {
+        if (arguments.length == 0) return chartTitle;
+        chartTitle = _;
+        return chart;
+      }
+
+      // x axis title
+      chart.xTitle = function (_) {
+        if (arguments.length == 0) return xTitle;
+        xTitle = _;
+        return chart;
+      }
+
+      // y axis title
+      chart.yTitle = function (_) {
+        if (arguments.length == 0) return yTitle;
+        yTitle = _;
+        return chart;
+      }
+
+      // bar width
+      chart.barWidth = function (_) {
+        if (arguments.length == 0) return barWidth;
+        barWidth = _;
+        return chart;
+      }
+
+      // halt
+      chart.halt = function (_) {
+        if (arguments.length === 0) return halted;
+        halted = _;
+        return chart;
+      };
+
+      // version
+      chart.version = version;
+
+      return chart;
+
+    } // end realTimeChart function
+
+  </script>
+</body>
+
+</html>
